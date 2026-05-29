@@ -768,6 +768,17 @@
   text-align: center;
   font-size: 13px;
 }
+.share-menu-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.share-menu-text small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
 .share-menu-divider { height: 1px; background: var(--border); margin: 4px 6px; }
 .template-share-popover {
   min-width: 320px;

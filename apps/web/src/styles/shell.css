@@ -618,7 +618,11 @@
 }
 .chrome-action-secondary:hover:not(:disabled) {
   background: var(--bg-subtle);
-  border-color: var(--text-muted);
+  border-color: var(--border);
+}
+.present-trigger[aria-expanded='true'] {
+  background: var(--bg-panel);
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
 }
 .chrome-action-primary {
   background: var(--text-strong);

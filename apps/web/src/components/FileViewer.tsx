@@ -63,10 +63,10 @@ import {
   exportReactComponentAsHtml,
   exportReactComponentAsZip,
   openSandboxedPreviewInNewTab,
-  requestPreviewSnapshot,
   requestPreviewSnapshotResult,
   type PreviewSnapshotResult,
 } from '../runtime/exports';
+import { copyToClipboard } from '../lib/copy-to-clipboard';
 import { buildReactComponentSrcdoc } from '../runtime/react-component';
 import { findHtmlEntriesReferencing } from '../runtime/jsx-module-refs';
 import { buildLazySrcdocTransport, buildSrcdoc, canActivateSrcDocTransport } from '../runtime/srcdoc';
@@ -573,6 +573,50 @@ async function previewSnapshotBlobFromIframes(
     fallback ??= result;
   }
   throw new Error(snapshotFailureMessage(fallback, t));
+}
+
+function deploymentTimestamp(deployment: WebDeploymentInfo): number {
+  const maybeDeployedAt = (deployment as WebDeploymentInfo & { deployedAt?: number | string }).deployedAt;
+  const candidates = [maybeDeployedAt, deployment.updatedAt, deployment.createdAt];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+    if (typeof candidate === 'string') {
+      const parsed = Date.parse(candidate);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return 0;
+}
+
+function compareDeploymentsByNewest(a: WebDeploymentInfo, b: WebDeploymentInfo): number {
+  return deploymentTimestamp(b) - deploymentTimestamp(a);
+}
+
+function shareUrlForDeployment(deployment: WebDeploymentInfo): string {
+  const customDomain = deployment.providerId === CLOUDFLARE_PAGES_PROVIDER_ID
+    ? deployment.cloudflarePages?.customDomain
+    : undefined;
+  if (customDomain?.status === 'ready' && customDomain.url?.trim()) {
+    return customDomain.url.trim();
+  }
+  return deployment.url?.trim() || '';
+}
+
+function resolveShareUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (typeof window === 'undefined') return trimmed;
+  return new URL(trimmed, window.location.origin).toString();
+}
+
+function pickLatestShareDeployment(
+  deploymentsByProvider: Partial<Record<WebDeployProviderId, WebDeploymentInfo>>,
+): WebDeploymentInfo | null {
+  return Object.values(deploymentsByProvider)
+    .filter((deployment): deployment is WebDeploymentInfo =>
+      Boolean(deployment && shareUrlForDeployment(deployment) && deployResultState(deployment.status) !== 'failed'))
+    .sort(compareDeploymentsByNewest)[0] ?? null;
 }
 
 async function requestPreviewSnapshotResultWithRetries(
@@ -3818,8 +3862,11 @@ function HtmlViewer({
       | 'pptx'
       | 'zip'
       | 'html'
+      | 'image'
       | 'markdown'
       | 'template'
+      | 'share_link'
+      | 'share_page'
       | 'vercel'
       | 'cloudflare_pages',
     fn: () => Promise<unknown> | unknown,
@@ -3827,6 +3874,7 @@ function HtmlViewer({
     const requestId = analytics.newRequestId();
     const artifactId = anonymizeArtifactId({ projectId, fileName: file.name });
     const artifactKind = artifactKindToTracking({ fileKind: file.kind ?? null });
+    const trackingFormat = format as Exclude<typeof format, 'image'>;
     trackShareOptionPopoverClick(
       analytics.track,
       {
@@ -3834,7 +3882,7 @@ function HtmlViewer({
         area: 'share_option_popover',
         artifact_id: artifactId,
         artifact_kind: artifactKind,
-        element: format,
+        element: trackingFormat,
         project_id: projectId,
         project_kind: projectKind,
       },
@@ -3851,7 +3899,7 @@ function HtmlViewer({
           artifact_kind: artifactKind,
           project_id: projectId,
           project_kind: projectKind,
-          export_format: format,
+          export_format: trackingFormat,
           result,
           ...(errorCode ? { error_code: errorCode } : {}),
           export_duration_ms: Math.round(performance.now() - started),
@@ -3859,7 +3907,7 @@ function HtmlViewer({
         { requestId },
       );
     };
-    const toastFormats = new Set(['pdf', 'pptx', 'zip', 'html', 'markdown']);
+    const toastFormats = new Set(['pdf', 'pptx', 'zip', 'html', 'image', 'markdown']);
     try {
       const out = fn();
       if (out && typeof (out as Promise<unknown>).then === 'function') {
@@ -4199,6 +4247,7 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
   const [templateSavedToast, setTemplateSavedToast] = useState<string | null>(null);
   const [deploySavedToast, setDeploySavedToast] = useState<{ message: string; details: string } | null>(null);
   const [exportToast, setExportToast] = useState<string | null>(null);
+  const [shareLinkFeedback, setShareLinkFeedback] = useState<'copied' | 'failed' | null>(null);
   const [selectedSideCommentIds, setSelectedSideCommentIds] = useState<Set<string>>(() => new Set());
   const [commentSidePanelCollapsed, setCommentSidePanelCollapsed] = useState(false);
   const [strokePoints, setStrokePoints] = useState<StrokePoint[]>([]);
@@ -4208,9 +4257,9 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
   function deploymentMapForCurrentFile(items: WebDeploymentInfo[]) {
     const next: Partial<Record<WebDeployProviderId, WebDeploymentInfo>> = {};
     for (const option of DEPLOY_PROVIDER_OPTIONS) {
-      const deploymentForProvider = items.find(
-        (item) => item.fileName === file.name && item.providerId === option.id && item.url?.trim(),
-      );
+      const deploymentForProvider = items
+        .filter((item) => item.fileName === file.name && item.providerId === option.id && item.url?.trim())
+        .sort(compareDeploymentsByNewest)[0];
       if (deploymentForProvider) next[option.id] = deploymentForProvider;
     }
     return next;
@@ -5862,6 +5911,23 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     }, 1800);
   }
 
+  async function copyShareLink(url: string) {
+    const safeUrl = url.trim();
+    if (!safeUrl) {
+      setShareLinkFeedback('failed');
+      setExportToast(t('useEverywhere.copyFailed'));
+      return false;
+    }
+    const ok = await copyToClipboard(safeUrl);
+    const feedback = ok ? 'copied' : 'failed';
+    setShareLinkFeedback(feedback);
+    if (!ok) setExportToast(t('useEverywhere.copyFailed'));
+    window.setTimeout(() => {
+      setShareLinkFeedback((current) => (current === feedback ? null : current));
+    }, 1800);
+    return ok;
+  }
+
   function presentInThisTab() {
     setPresentMenuOpen(false);
     setInTabPresent(true);
@@ -6160,9 +6226,45 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
   }, [screenshotToast]);
 
   const showPresent = source !== null;
-  const canShare = source !== null;
   const exportTitle = file.name.replace(/\.html?$/i, '') || file.name;
-  const canPptx = canShare && Boolean(onExportAsPptx) && !streaming;
+  const artifactKind = file.artifactManifest?.kind ?? file.artifactKind ?? null;
+  const rendererId = file.artifactManifest?.renderer ?? null;
+  const isDeckArtifact = isDeck || artifactKind === 'deck' || rendererId === 'deck-html' || file.kind === 'presentation';
+  const isMarkdownArtifact =
+    artifactKind === 'markdown-document' ||
+    rendererId === 'markdown' ||
+    file.kind === 'text' && /\.mdx?$/i.test(file.name);
+  const isShareableArtifact =
+    file.kind === 'html' ||
+    isDeckArtifact ||
+    artifactKind === 'html' ||
+    rendererId === 'html';
+  const canShare = source !== null && isShareableArtifact;
+  const canPptx = canShare && isDeckArtifact && Boolean(onExportAsPptx) && !streaming;
+  const showPptxExport = canShare && isDeckArtifact;
+  const showMarkdownExport = canShare && isMarkdownArtifact;
+  const showImageExport = canShare;
+
+  async function exportPreviewAsImage() {
+    const iframes = [
+      srcDocPreviewIframeRef.current,
+      iframeRef.current === srcDocPreviewIframeRef.current ? null : iframeRef.current,
+    ];
+    let fallback: PreviewSnapshotResult | undefined;
+    for (const iframe of iframes) {
+      if (!iframe) {
+        fallback ??= { ok: false, reason: 'loading' };
+        continue;
+      }
+      const result = await requestPreviewSnapshotResultWithRetries(iframe);
+      if (result.ok) {
+        exportAsImage(result.snapshot.dataUrl, exportTitle);
+        return;
+      }
+      fallback ??= result;
+    }
+    throw new Error(snapshotFailureMessage(fallback, t));
+  }
   useEffect(() => {
     const nudgeKey = `${projectId}\n${file.name}`;
     if (!canShare || exportReadyNudgeSeenRef.current.has(nudgeKey)) return;
@@ -6263,11 +6365,39 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
       ? t('fileViewer.redeployToProvider', { provider: label })
       : t('fileViewer.deployToProvider', { provider: label });
   };
-  const deployCopyLinks = DEPLOY_PROVIDER_OPTIONS.map((option) => ({
-    providerId: option.id,
-    providerLabel: t(option.labelKey),
-    url: deploymentsByProvider[option.id]?.url?.trim() || '',
-  })).filter((item) => item.url);
+  const latestShareDeployment = useMemo(
+    () => pickLatestShareDeployment(deploymentsByProvider),
+    [deploymentsByProvider],
+  );
+  const latestDeployedShareUrl = latestShareDeployment
+    ? shareUrlForDeployment(latestShareDeployment)
+    : '';
+  const latestShareState = latestShareDeployment
+    ? deployResultState(latestShareDeployment.status)
+    : null;
+  const sharePageUrl = useMemo(
+    () => resolveShareUrl(latestDeployedShareUrl),
+    [latestDeployedShareUrl],
+  );
+  const canCopyShareLink = !streaming && Boolean(sharePageUrl);
+  const canOpenSharePage = !streaming && Boolean(sharePageUrl) && latestShareState !== 'delayed';
+  const shareLinkStatusHint =
+    streaming
+      ? t('fileViewer.shareAfterGenerationComplete')
+      : latestShareState === 'delayed'
+      ? t('fileViewer.deployLinkDelayed')
+      : latestShareState === 'protected'
+        ? t('fileViewer.deployLinkProtected')
+        : '';
+  const shareUnavailableHint = streaming
+    ? t('fileViewer.shareAfterGenerationComplete')
+    : t('fileViewer.shareLinkRequiresDeploy');
+  const copyShareLinkLabel =
+    shareLinkFeedback === 'copied'
+      ? t('fileViewer.copied')
+      : shareLinkFeedback === 'failed'
+        ? t('useEverywhere.copyFailed')
+        : t('fileViewer.copyShareLink');
   const deployButtonLabel =
     deployPhase === 'deploying'
       ? t('fileViewer.deployingToProvider', { provider: deployProviderLabel })
@@ -6278,12 +6408,6 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     copiedDeployLink === url.trim()
       ? t('fileViewer.copied')
       : t('fileViewer.copyDeployLink');
-  const copyDeployMenuLabel = (providerLabel: string, url: string) =>
-    copiedDeployLink === url.trim()
-      ? t('fileViewer.copied')
-      : providerLabel.toLowerCase().includes('cloudflare')
-        ? t('fileViewer.copyCloudflareLink')
-        : t('fileViewer.copyProviderLink', { provider: providerLabel });
   const statusLabelFor = (state: ReturnType<typeof deployResultState>) => {
     if (state === 'ready') return t('fileViewer.deployLinkReady');
     if (state === 'protected') return t('fileViewer.deployLinkProtectedLabel');
@@ -6730,35 +6854,64 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
                 aria-expanded={shareMenuOpen}
                 onClick={openExportMenu}
               >
-                <Icon name="download" size={13} />
+                <Icon name="share" size={13} />
                 <span>{t('fileViewer.shareLabel')}</span>
                 <Icon name="chevron-down" size={11} />
               </button>
               {shareMenuOpen ? (
                 <div className="share-menu-popover" role="menu">
-                  {deployCopyLinks.length > 0 ? (
-                    <>
-                      <div className="share-menu-section-label" role="presentation">
-                        {t('fileViewer.shareMenuShareLink')}
-                      </div>
-                      {deployCopyLinks.map((item) => (
-                        <button
-                          key={`copy-${item.providerId}`}
-                          type="button"
-                          className="share-menu-item"
-                          role="menuitem"
-                          onClick={() => {
-                            setShareMenuOpen(false);
-                            void copyDeployLink(item.url);
-                          }}
-                        >
-                          <span className="share-menu-icon"><RemixIcon name="file-copy-line" size={15} /></span>
-                          <span>{copyDeployMenuLabel(item.providerLabel, item.url)}</span>
-                        </button>
-                      ))}
-                      <div className="share-menu-divider" />
-                    </>
-                  ) : null}
+                  <div className="share-menu-section-label" role="presentation">
+                    {t('fileViewer.shareMenuShareLink')}
+                  </div>
+                  <button
+                    type="button"
+                    className="share-menu-item"
+                    role="menuitem"
+                    disabled={!canCopyShareLink}
+                    title={!canCopyShareLink ? shareUnavailableHint : shareLinkStatusHint || undefined}
+                    onClick={() => {
+                      if (!canCopyShareLink || !sharePageUrl) return;
+                      fireShareExport('share_link', async () => {
+                        const ok = await copyShareLink(sharePageUrl);
+                        if (!ok) throw new Error('copy_share_link_failed');
+                      });
+                    }}
+                  >
+                    <span className="share-menu-icon"><RemixIcon name="file-copy-line" size={15} /></span>
+                    <span className="share-menu-text">
+                      <span>{copyShareLinkLabel}</span>
+                      {!canCopyShareLink ? (
+                        <small>{shareUnavailableHint}</small>
+                      ) : shareLinkStatusHint ? (
+                        <small>{shareLinkStatusHint}</small>
+                      ) : null}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="share-menu-item"
+                    role="menuitem"
+                    disabled={!canOpenSharePage}
+                    title={!canOpenSharePage ? shareLinkStatusHint || shareUnavailableHint : shareLinkStatusHint || undefined}
+                    onClick={() => {
+                      if (!canOpenSharePage || !sharePageUrl) return;
+                      setShareMenuOpen(false);
+                      fireShareExport('share_page', () => {
+                        window.open(sharePageUrl, '_blank', 'noopener');
+                      });
+                    }}
+                  >
+                    <span className="share-menu-icon"><RemixIcon name="external-link-line" size={15} /></span>
+                    <span className="share-menu-text">
+                      <span>{t('fileViewer.openSharePage')}</span>
+                      {!canOpenSharePage && !sharePageUrl ? (
+                        <small>{shareUnavailableHint}</small>
+                      ) : shareLinkStatusHint ? (
+                        <small>{shareLinkStatusHint}</small>
+                      ) : null}
+                    </span>
+                  </button>
+                  <div className="share-menu-divider" />
                   <div className="share-menu-section-label" role="presentation">
                     {t('fileViewer.shareMenuPublishOnline')}
                   </div>
@@ -6786,12 +6939,9 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
                   <div className="share-menu-section-label" role="presentation">
                     {t('fileViewer.shareMenuDownload')}
                   </div>
-                  <div className="share-menu-subsection-label" role="presentation">
-                    {t('fileViewer.shareMenuPresentation')}
-                  </div>
                   <button
                     type="button"
-                    className="share-menu-item share-menu-subitem"
+                    className="share-menu-item"
                     role="menuitem"
                     onClick={() => {
                       setShareMenuOpen(false);
@@ -6805,67 +6955,49 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
                     }}
                   >
                     <span className="share-menu-icon"><RemixIcon name="file-line" size={15} /></span>
-                    <span>
-                      {effectiveDeck
-                        ? t('fileViewer.exportPdfAllSlides')
-                        : t('fileViewer.exportPdf')}
-                    </span>
+                    <span>{t('fileViewer.exportPdf')}</span>
                   </button>
-                  <button
-                    type="button"
-                    className="share-menu-item share-menu-subitem"
-                    role="menuitem"
-                    disabled={!canPptx}
-                    title={
-                      onExportAsPptx
-                        ? streaming
-                          ? t('fileViewer.exportPptxBusy')
-                          : t('fileViewer.exportPptxHint')
-                        : t('fileViewer.exportPptxNa')
-                    }
-                    onClick={() => {
-                      setShareMenuOpen(false);
-                      fireShareExport('pptx', () => {
-                        if (onExportAsPptx) onExportAsPptx(file.name);
-                      });
-                    }}
-                  >
-                    <span className="share-menu-icon"><RemixIcon name="file-ppt-line" size={15} /></span>
-                    <span>{t('fileViewer.exportPptx') + '…'}</span>
-                  </button>
-                  {!useUrlLoadPreview ? (
+                  {showPptxExport ? (
                     <button
                       type="button"
-                      className="share-menu-item share-menu-subitem"
+                      className="share-menu-item"
                       role="menuitem"
-                      onClick={async () => {
+                      disabled={!canPptx}
+                      title={
+                        onExportAsPptx
+                          ? streaming
+                            ? t('fileViewer.exportPptxBusy')
+                            : t('fileViewer.exportPptxHint')
+                          : t('fileViewer.exportPptxNa')
+                      }
+                      onClick={() => {
                         setShareMenuOpen(false);
-                        const iframe = iframeRef.current;
-                        if (!iframe) return;
-                        const snap = await requestPreviewSnapshot(iframe);
-                        try {
-                          if (snap) {
-                            exportAsImage(snap.dataUrl, exportTitle);
-                          } else {
-                            console.warn('[exportAsImage] snapshot capture returned null');
-                            alert(t('fileViewer.exportImageFailed'));
-                          }
-                        } catch (err) {
-                          console.warn('[exportAsImage] failed to convert snapshot:', err);
-                          alert(t('fileViewer.exportImageFailed'));
-                        }
+                        fireShareExport('pptx', () => {
+                          if (onExportAsPptx) onExportAsPptx(file.name);
+                        });
+                      }}
+                    >
+                      <span className="share-menu-icon"><RemixIcon name="file-ppt-line" size={15} /></span>
+                      <span>{t('fileViewer.exportPptx')}</span>
+                    </button>
+                  ) : null}
+                  {showImageExport ? (
+                    <button
+                      type="button"
+                      className="share-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setShareMenuOpen(false);
+                        fireShareExport('image', () => exportPreviewAsImage());
                       }}
                     >
                       <span className="share-menu-icon"><RemixIcon name="image-line" size={15} /></span>
                       <span>{t('fileViewer.exportImage')}</span>
                     </button>
                   ) : null}
-                  <div className="share-menu-subsection-label" role="presentation">
-                    {t('fileViewer.shareMenuSourceFiles')}
-                  </div>
                   <button
                     type="button"
-                    className="share-menu-item share-menu-subitem"
+                    className="share-menu-item"
                     role="menuitem"
                     onClick={() => {
                       setShareMenuOpen(false);
@@ -6882,7 +7014,7 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
                   </button>
                   <button
                     type="button"
-                    className="share-menu-item share-menu-subitem"
+                    className="share-menu-item"
                     role="menuitem"
                     onClick={() => {
                       setShareMenuOpen(false);
@@ -6892,24 +7024,20 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
                     <span className="share-menu-icon"><RemixIcon name="file-code-line" size={15} /></span>
                     <span>{t('fileViewer.exportHtml')}</span>
                   </button>
-                  {/* Export as Markdown — pass-through download of the
-                      artifact source with a `.md` extension. No conversion
-                      runs; the file body is identical to the Source view.
-                      Useful for piping the artifact into markdown-aware
-                      tooling (LLM context windows, vault apps). See
-                      issue #279. */}
-                  <button
-                    type="button"
-                    className="share-menu-item share-menu-subitem"
-                    role="menuitem"
-                    onClick={() => {
-                      setShareMenuOpen(false);
-                      fireShareExport('markdown', () => exportAsMd(source ?? '', exportTitle));
-                    }}
-                  >
-                    <span className="share-menu-icon"><RemixIcon name="file-line" size={15} /></span>
-                    <span>{t('fileViewer.exportMd')}</span>
-                  </button>
+                  {showMarkdownExport ? (
+                    <button
+                      type="button"
+                      className="share-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setShareMenuOpen(false);
+                        fireShareExport('markdown', () => exportAsMd(source ?? '', exportTitle));
+                      }}
+                    >
+                      <span className="share-menu-icon"><RemixIcon name="file-line" size={15} /></span>
+                      <span>{t('fileViewer.exportMd')}</span>
+                    </button>
+                  ) : null}
                   <div className="share-menu-divider" />
                   <div className="share-menu-section-label" role="presentation">
                     {t('fileViewer.shareMenuSave')}
